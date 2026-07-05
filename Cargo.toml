@@ -1,0 +1,16 @@
+[package]
+name = "wormhole-core"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "PortalGems wormhole engine: app-shaped wrapper around magic-wormhole.rs"
+
+[dependencies]
+magic-wormhole = "0.8.1"
+async-fs = "2"
+futures-lite = "2"
+thiserror = "2"
+
+[dev-dependencies]
+async-io = "2"
+anyhow = "1"
