@@ -12,7 +12,7 @@ use futures_lite::future::pending;
 uniffi::setup_scaffolding!();
 
 mod ffi;
-pub use ffi::TransferListener;
+pub use ffi::{create_test_file, TransferListener};
 use magic_wormhole::{
     transfer::{self, APP_CONFIG},
     transit::{self, Abilities, RelayHint, TransitInfo},
