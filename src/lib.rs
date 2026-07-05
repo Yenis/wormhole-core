@@ -8,6 +8,11 @@
 use std::path::{Path, PathBuf};
 
 use futures_lite::future::pending;
+
+uniffi::setup_scaffolding!();
+
+mod ffi;
+pub use ffi::TransferListener;
 use magic_wormhole::{
     transfer::{self, APP_CONFIG},
     transit::{self, Abilities, RelayHint, TransitInfo},
@@ -17,7 +22,8 @@ use magic_wormhole::{
 /// Number of wordlist words in generated codes (the CLI default).
 pub const DEFAULT_CODE_LENGTH: usize = 2;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+#[uniffi(flat_error)]
 pub enum Error {
     #[error("invalid wormhole code: {0}")]
     InvalidCode(String),

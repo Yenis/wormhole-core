@@ -5,12 +5,17 @@ edition = "2021"
 license = "GPL-3.0-or-later"
 description = "PortalGems wormhole engine: app-shaped wrapper around magic-wormhole.rs"
 
+[lib]
+crate-type = ["rlib", "cdylib", "staticlib"]
+
 [dependencies]
 magic-wormhole = "0.8.1"
 async-fs = "2"
 futures-lite = "2"
 thiserror = "2"
+uniffi = "0.31"
 
 [dev-dependencies]
 async-io = "2"
 anyhow = "1"
+uniffi = { version = "0.31", features = ["cli"] }
