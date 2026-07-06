@@ -5,7 +5,15 @@
 //! generics, so callbacks are funneled through the `TransferListener` trait,
 //! which foreign code implements.
 
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+use futures_lite::future::pending;
+use magic_wormhole::{
+    transfer::{self, APP_CONFIG},
+    transit::Abilities,
+    MailboxConnection, Wormhole,
+};
 
 use crate::Error;
 
@@ -61,6 +69,86 @@ pub fn create_test_file(dir: String, size_kb: u32) -> Result<String, Error> {
     }
     file.sync_all()?;
     Ok(path.to_string_lossy().into_owned())
+}
+
+/// A pending file offer. Inspect `file_name`/`file_size`, then `accept` into a
+/// destination directory or `reject` to tell the sender you declined.
+#[derive(uniffi::Object)]
+pub struct IncomingFile {
+    name: String,
+    size: u64,
+    request: Mutex<Option<transfer::ReceiveRequest>>,
+}
+
+/// Connect to the wormhole under `code` and wait for the sender's file offer,
+/// without accepting it yet. This is what allows a confirmation UI.
+#[uniffi::export]
+pub async fn request_receive(code: String) -> Result<Arc<IncomingFile>, Error> {
+    let parsed = code.parse().map_err(|_| Error::InvalidCode(code.clone()))?;
+    let mailbox = MailboxConnection::connect(APP_CONFIG, parsed, false).await?;
+    let wormhole = Wormhole::connect(mailbox).await?;
+    let request = transfer::request_file(
+        wormhole,
+        crate::default_relay_hints(),
+        Abilities::ALL,
+        pending::<()>(),
+    )
+    .await?
+    .ok_or(Error::Cancelled)?;
+
+    Ok(Arc::new(IncomingFile {
+        name: crate::sanitize_file_name(&request.file_name()),
+        size: request.file_size(),
+        request: Mutex::new(Some(request)),
+    }))
+}
+
+#[uniffi::export]
+impl IncomingFile {
+    pub fn file_name(&self) -> String {
+        self.name.clone()
+    }
+
+    pub fn file_size(&self) -> u64 {
+        self.size
+    }
+
+    /// Accept the offer, writing into `dest_dir`; returns the saved path.
+    pub async fn accept(
+        &self,
+        dest_dir: String,
+        listener: Arc<dyn TransferListener>,
+    ) -> Result<String, Error> {
+        let request = self
+            .request
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or(Error::AlreadyConsumed)?;
+        let transit_listener = listener.clone();
+        let (dest, mut file) = crate::create_unique(Path::new(&dest_dir), &self.name).await?;
+        request
+            .accept(
+                |info| transit_listener.on_transit(crate::describe_transit(&info)),
+                move |done, total| listener.on_progress(done, total),
+                &mut file,
+                pending::<()>(),
+            )
+            .await?;
+        Ok(dest.to_string_lossy().into_owned())
+    }
+
+    /// Decline the offer; the sender sees the transfer fail cleanly.
+    pub async fn reject(&self) -> Result<(), Error> {
+        let request = self
+            .request
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or(Error::AlreadyConsumed)?;
+        request.reject().await?;
+        Ok(())
+    }
 }
 
 /// Receive the file offered under `code` into `dest_dir`; returns the saved path.

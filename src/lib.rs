@@ -12,7 +12,7 @@ use futures_lite::future::pending;
 uniffi::setup_scaffolding!();
 
 mod ffi;
-pub use ffi::{create_test_file, TransferListener};
+pub use ffi::{create_test_file, IncomingFile, TransferListener};
 use magic_wormhole::{
     transfer::{self, APP_CONFIG},
     transit::{self, Abilities, RelayHint, TransitInfo},
@@ -29,6 +29,8 @@ pub enum Error {
     InvalidCode(String),
     #[error("the transfer was cancelled")]
     Cancelled,
+    #[error("this transfer was already accepted or rejected")]
+    AlreadyConsumed,
     #[error(transparent)]
     Wormhole(#[from] magic_wormhole::WormholeError),
     #[error(transparent)]
@@ -37,14 +39,14 @@ pub enum Error {
     Io(#[from] std::io::Error),
 }
 
-fn default_relay_hints() -> Vec<RelayHint> {
+pub(crate) fn default_relay_hints() -> Vec<RelayHint> {
     vec![
         RelayHint::from_urls(None, [transit::DEFAULT_RELAY_SERVER.parse().unwrap()])
             .expect("default relay URL is valid"),
     ]
 }
 
-fn describe_transit(info: &TransitInfo) -> String {
+pub(crate) fn describe_transit(info: &TransitInfo) -> String {
     format!("{:?} peer={}", info.conn_type, info.peer_addr)
 }
 
@@ -139,7 +141,7 @@ where
 }
 
 /// Strip any path components the sender may have smuggled into the file name.
-fn sanitize_file_name(name: &str) -> String {
+pub(crate) fn sanitize_file_name(name: &str) -> String {
     Path::new(name)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -149,7 +151,10 @@ fn sanitize_file_name(name: &str) -> String {
 
 /// Open `dir/name` for writing without clobbering: falls back to
 /// `name (1)`, `name (2)`, … if the file already exists.
-async fn create_unique(dir: &Path, name: &str) -> Result<(PathBuf, async_fs::File), Error> {
+pub(crate) async fn create_unique(
+    dir: &Path,
+    name: &str,
+) -> Result<(PathBuf, async_fs::File), Error> {
     let (stem, ext) = match name.rsplit_once('.') {
         Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
         _ => (name.to_string(), String::new()),
