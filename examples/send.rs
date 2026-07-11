@@ -28,6 +28,7 @@ fn main() -> anyhow::Result<()> {
                     out(format!("PROGRESS:{pct}"));
                 }
             },
+            std::future::pending::<()>(),
         )
         .await
     })?;

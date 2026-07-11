@@ -60,6 +60,7 @@ pub async fn send_file<F, G, H>(
     on_code: F,
     on_transit: G,
     progress: H,
+    cancel: impl std::future::Future<Output = ()>,
 ) -> Result<(), Error>
 where
     F: FnOnce(String),
@@ -78,28 +79,110 @@ where
         .to_string_lossy()
         .into_owned();
 
-    let mailbox = match code {
-        None => MailboxConnection::create(APP_CONFIG, DEFAULT_CODE_LENGTH).await?,
-        Some(raw) => {
-            let code = raw.parse().map_err(|_| Error::InvalidCode(raw.into()))?;
-            MailboxConnection::connect(APP_CONFIG, code, true).await?
-        },
-    };
-    on_code(mailbox.code().to_string());
+    // Race the whole pipeline against `cancel`: a sender waiting for its
+    // receiver blocks inside Wormhole::connect (the PAKE needs a peer), so
+    // cancellation must cover more than just the transfer phase.
+    let work = async {
+        let mailbox = match code {
+            None => MailboxConnection::create(APP_CONFIG, DEFAULT_CODE_LENGTH).await?,
+            Some(raw) => {
+                let code = raw.parse().map_err(|_| Error::InvalidCode(raw.into()))?;
+                MailboxConnection::connect(APP_CONFIG, code, true).await?
+            },
+        };
+        on_code(mailbox.code().to_string());
 
-    let wormhole = Wormhole::connect(mailbox).await?;
-    transfer::send_file_or_folder(
-        wormhole,
-        default_relay_hints(),
-        path,
-        file_name,
-        Abilities::ALL,
-        |info| on_transit(describe_transit(&info)),
-        progress,
-        pending::<()>(),
-    )
-    .await?;
-    Ok(())
+        let wormhole = Wormhole::connect(mailbox).await?;
+        transfer::send_file_or_folder(
+            wormhole,
+            default_relay_hints(),
+            path,
+            file_name,
+            Abilities::ALL,
+            |info| on_transit(describe_transit(&info)),
+            progress,
+            pending::<()>(),
+        )
+        .await?;
+        Ok(())
+    };
+    futures_lite::future::or(work, async {
+        cancel.await;
+        Err(Error::Cancelled)
+    })
+    .await
+}
+
+/// A file offer that has been received but not yet accepted: the platform
+/// bindings build their confirmation UIs on top of this.
+pub struct PendingReceive {
+    pub file_name: String,
+    pub file_size: u64,
+    request: transfer::ReceiveRequest,
+}
+
+/// Connect to the wormhole under `code` and wait for the sender's offer,
+/// without accepting it.
+pub async fn request_receive(
+    code: &str,
+    cancel: impl std::future::Future<Output = ()>,
+) -> Result<PendingReceive, Error> {
+    let work = async {
+        let parsed = code.parse().map_err(|_| Error::InvalidCode(code.into()))?;
+        let mailbox = MailboxConnection::connect(APP_CONFIG, parsed, false).await?;
+        let wormhole = Wormhole::connect(mailbox).await?;
+        let request = transfer::request_file(
+            wormhole,
+            default_relay_hints(),
+            Abilities::ALL,
+            pending::<()>(),
+        )
+        .await?
+        .ok_or(Error::Cancelled)?;
+
+        Ok(PendingReceive {
+            file_name: sanitize_file_name(&request.file_name()),
+            file_size: request.file_size(),
+            request,
+        })
+    };
+    futures_lite::future::or(work, async {
+        cancel.await;
+        Err(Error::Cancelled)
+    })
+    .await
+}
+
+impl PendingReceive {
+    /// Accept the offer, writing into `dest_dir`; returns the saved path.
+    pub async fn accept<G, H>(
+        self,
+        dest_dir: impl AsRef<Path>,
+        on_transit: G,
+        progress: H,
+        cancel: impl std::future::Future<Output = ()>,
+    ) -> Result<PathBuf, Error>
+    where
+        G: FnOnce(String),
+        H: FnMut(u64, u64) + 'static,
+    {
+        let (dest, mut file) = create_unique(dest_dir.as_ref(), &self.file_name).await?;
+        self.request
+            .accept(
+                |info| on_transit(describe_transit(&info)),
+                progress,
+                &mut file,
+                cancel,
+            )
+            .await?;
+        Ok(dest)
+    }
+
+    /// Decline the offer; the sender sees the transfer fail cleanly.
+    pub async fn reject(self) -> Result<(), Error> {
+        self.request.reject().await?;
+        Ok(())
+    }
 }
 
 /// Receive a file offered under `code` into `dest_dir`. The sender's file name
@@ -109,35 +192,16 @@ pub async fn receive_file<G, H>(
     dest_dir: impl AsRef<Path>,
     on_transit: G,
     progress: H,
+    cancel: impl std::future::Future<Output = ()>,
 ) -> Result<PathBuf, Error>
 where
     G: FnOnce(String),
     H: FnMut(u64, u64) + 'static,
 {
-    let parsed = code.parse().map_err(|_| Error::InvalidCode(code.into()))?;
-    let mailbox = MailboxConnection::connect(APP_CONFIG, parsed, false).await?;
-    let wormhole = Wormhole::connect(mailbox).await?;
-
-    let request = transfer::request_file(
-        wormhole,
-        default_relay_hints(),
-        Abilities::ALL,
-        pending::<()>(),
-    )
-    .await?
-    .ok_or(Error::Cancelled)?;
-
-    let file_name = sanitize_file_name(&request.file_name());
-    let (dest, mut file) = create_unique(dest_dir.as_ref(), &file_name).await?;
-    request
-        .accept(
-            |info| on_transit(describe_transit(&info)),
-            progress,
-            &mut file,
-            pending::<()>(),
-        )
-        .await?;
-    Ok(dest)
+    let pending_receive = request_receive(code, pending::<()>()).await?;
+    pending_receive
+        .accept(dest_dir, on_transit, progress, cancel)
+        .await
 }
 
 /// Strip any path components the sender may have smuggled into the file name.

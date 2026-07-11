@@ -5,17 +5,11 @@
 //! generics, so callbacks are funneled through the `TransferListener` trait,
 //! which foreign code implements.
 
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use futures_lite::future::pending;
-use magic_wormhole::{
-    transfer::{self, APP_CONFIG},
-    transit::Abilities,
-    MailboxConnection, Wormhole,
-};
 
-use crate::Error;
+use crate::{Error, PendingReceive};
 
 /// Implemented by the app (Kotlin/TypeScript) to observe a running transfer.
 #[uniffi::export(with_foreign)]
@@ -45,6 +39,7 @@ pub async fn send_file(
         move |code| code_listener.on_code(code),
         move |info| transit_listener.on_transit(info),
         move |done, total| listener.on_progress(done, total),
+        pending::<()>(),
     )
     .await
 }
@@ -77,29 +72,18 @@ pub fn create_test_file(dir: String, size_kb: u32) -> Result<String, Error> {
 pub struct IncomingFile {
     name: String,
     size: u64,
-    request: Mutex<Option<transfer::ReceiveRequest>>,
+    request: Mutex<Option<PendingReceive>>,
 }
 
 /// Connect to the wormhole under `code` and wait for the sender's file offer,
 /// without accepting it yet. This is what allows a confirmation UI.
 #[uniffi::export]
 pub async fn request_receive(code: String) -> Result<Arc<IncomingFile>, Error> {
-    let parsed = code.parse().map_err(|_| Error::InvalidCode(code.clone()))?;
-    let mailbox = MailboxConnection::connect(APP_CONFIG, parsed, false).await?;
-    let wormhole = Wormhole::connect(mailbox).await?;
-    let request = transfer::request_file(
-        wormhole,
-        crate::default_relay_hints(),
-        Abilities::ALL,
-        pending::<()>(),
-    )
-    .await?
-    .ok_or(Error::Cancelled)?;
-
+    let pending_receive = crate::request_receive(&code, pending::<()>()).await?;
     Ok(Arc::new(IncomingFile {
-        name: crate::sanitize_file_name(&request.file_name()),
-        size: request.file_size(),
-        request: Mutex::new(Some(request)),
+        name: pending_receive.file_name.clone(),
+        size: pending_receive.file_size,
+        request: Mutex::new(Some(pending_receive)),
     }))
 }
 
@@ -126,12 +110,11 @@ impl IncomingFile {
             .take()
             .ok_or(Error::AlreadyConsumed)?;
         let transit_listener = listener.clone();
-        let (dest, mut file) = crate::create_unique(Path::new(&dest_dir), &self.name).await?;
-        request
+        let dest = request
             .accept(
-                |info| transit_listener.on_transit(crate::describe_transit(&info)),
+                &dest_dir,
+                move |info| transit_listener.on_transit(info),
                 move |done, total| listener.on_progress(done, total),
-                &mut file,
                 pending::<()>(),
             )
             .await?;
@@ -164,6 +147,7 @@ pub async fn receive_file(
         &dest_dir,
         move |info| transit_listener.on_transit(info),
         move |done, total| listener.on_progress(done, total),
+        pending::<()>(),
     )
     .await?;
     Ok(path.to_string_lossy().into_owned())
