@@ -52,7 +52,7 @@ pub(crate) fn describe_transit(info: &TransitInfo) -> String {
 
 /// Send a file (or folder). With `code: None` a fresh code is generated and
 /// reported through `on_code`. With `code: Some(..)` the wormhole is opened on
-/// that exact code (`allocate = true` claims the nameplate) — this is what
+/// that exact code (`allocate = true` claims the nameplate) - this is what
 /// paired devices use to meet on a derived code without typing anything.
 pub async fn send_file<F, G, H>(
     path: impl AsRef<Path>,
@@ -244,4 +244,87 @@ pub(crate) async fn create_unique(
         std::io::ErrorKind::AlreadyExists,
         "could not find a free file name",
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_strips_path_components_and_empties() {
+        assert_eq!(sanitize_file_name("normal.jpg"), "normal.jpg");
+        assert_eq!(sanitize_file_name("../../etc/passwd"), "passwd");
+        assert_eq!(sanitize_file_name("/abs/path/file.txt"), "file.txt");
+        assert_eq!(sanitize_file_name(""), "received.bin");
+        assert_eq!(sanitize_file_name(".."), "received.bin");
+        assert_eq!(sanitize_file_name("."), "received.bin");
+    }
+
+    #[test]
+    fn create_unique_never_clobbers() {
+        futures_lite::future::block_on(async {
+            let dir = std::env::temp_dir().join(format!("pg-core-test-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let (p1, _) = create_unique(&dir, "a.txt").await.unwrap();
+            let (p2, _) = create_unique(&dir, "a.txt").await.unwrap();
+            let (p3, _) = create_unique(&dir, "a.txt").await.unwrap();
+            assert_eq!(p1.file_name().unwrap(), "a.txt");
+            assert_eq!(p2.file_name().unwrap(), "a (1).txt");
+            assert_eq!(p3.file_name().unwrap(), "a (2).txt");
+            // extensionless names get plain " (n)" suffixes too
+            let (q1, _) = create_unique(&dir, "noext").await.unwrap();
+            let (q2, _) = create_unique(&dir, "noext").await.unwrap();
+            assert_eq!(q1.file_name().unwrap(), "noext");
+            assert_eq!(q2.file_name().unwrap(), "noext (1)");
+            std::fs::remove_dir_all(&dir).ok();
+        });
+    }
+
+    #[test]
+    fn create_test_file_writes_requested_size() {
+        let dir = std::env::temp_dir();
+        let path = create_test_file(dir.to_string_lossy().into_owned(), 4).unwrap();
+        let len = std::fs::metadata(&path).unwrap().len();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(len, 4 * 1024);
+    }
+
+    /// Full network round-trip against the public mailbox server; run with
+    /// `cargo test -- --ignored` when online.
+    #[test]
+    #[ignore]
+    fn roundtrip_over_public_server() {
+        futures_lite::future::block_on(async {
+            let dir = std::env::temp_dir().join(format!("pg-rt-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let src = create_test_file(dir.to_string_lossy().into_owned(), 64).unwrap();
+            let code = format!(
+                "9{}-integration-test",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .subsec_nanos()
+                    % 1_000_000
+            );
+            let send_code = code.clone();
+            let src_clone = src.clone();
+            let sender = std::thread::spawn(move || {
+                futures_lite::future::block_on(send_file(
+                    &src_clone,
+                    Some(&send_code),
+                    |_| {},
+                    |_| {},
+                    |_, _| {},
+                    futures_lite::future::pending::<()>(),
+                ))
+            });
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let dest = receive_file(&code, &dir, |_| {}, |_, _| {}, futures_lite::future::pending::<()>())
+                .await
+                .unwrap();
+            sender.join().unwrap().unwrap();
+            assert_eq!(std::fs::read(&src).unwrap(), std::fs::read(&dest).unwrap());
+            std::fs::remove_dir_all(&dir).ok();
+        });
+    }
 }

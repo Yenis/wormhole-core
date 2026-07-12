@@ -1,7 +1,7 @@
 //! The UniFFI surface: what Kotlin (Android) and, via
 //! uniffi-bindgen-react-native, TypeScript see of this crate.
 //!
-//! Thin wrappers over the generic functions in `lib.rs` — UniFFI cannot export
+//! Thin wrappers over the generic functions in `lib.rs` - UniFFI cannot export
 //! generics, so callbacks are funneled through the `TransferListener` trait,
 //! which foreign code implements.
 
